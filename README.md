@@ -137,27 +137,6 @@ LLP is a fully decentralized protocol that allows:
 
 ---
 
-## **9. Testing and Deployment**
+## **9. Conclusion**
 
-- **Signet**: Tested with test BTC and mock USDT Taproot Assets to verify functionality.
-- **Mainnet**: Alpha launch planned post-July 2024 Taproot Assets release, with phased rollout and risk warnings.
-- **Tools**: Built on LND, `tapd`, and custom LLP software.
-
----
-
-## **10. Future Extensions**
-
-- Additional Taproot Assets (e.g., other stablecoins).
-- Cross-chain collateral via bridges.
-- Syndicated loans for larger amounts.
-- Enhanced privacy with zero-knowledge proofs.
-
----
-
-## **11. Conclusion**
-
-The **Lightning Loan Protocol (LLP)** pioneers decentralized lending on Bitcoin, offering a trustless, efficient, and scalable solution for BTC-backed USDT loans. By integrating Taproot’s scripting, Lightning’s speed, and a P2P matching system, LLP eliminates intermediaries, ensures security, and supports daily interest payments. With testing on Signet and a mainnet rollout targeted for April 2025, LLP promises to advance Bitcoin-based DeFi.
-
----
-
-**Disclaimer:** This white paper outlines a conceptual framework. Implementation requires rigorous testing, security audits, and regulatory review. Users should approach alpha releases with caution.
+The **Lightning Loan Protocol (LLP)** pioneers decentralized lending on Bitcoin, offering a trustless, efficient, and scalable solution for BTC-backed USDT loans. By integrating Taproot’s scripting, Lightning’s speed, and a P2P matching system, LLP eliminates intermediaries, ensures security, and supports daily interest payments.
