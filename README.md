@@ -1,8 +1,8 @@
 # **Lightning Loan Protocol (LLP): A Decentralized Bitcoin-Backed USDT Loan Service**
 
-**Version:** 0.1 Alpha  
-**Date:** 2025-04-28
-**Authors:** Stefan Kreuter & Grok, xAi
+- **Version:** 0.1 Alpha  
+- **Date:** 2025-04-28
+- **Authors:** Stefan Kreuter & Grok, xAi
 
 ---
 
