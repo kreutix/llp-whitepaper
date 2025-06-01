@@ -64,10 +64,22 @@ type P2PNode struct {
 	peers         map[peer.ID]time.Time
 	orderCache    map[string]time.Time // Cache to avoid reprocessing messages
 	cacheMutex    sync.RWMutex
+
+	// Oracle related fields
+	latestBTCPriceUSDT float64
+	priceMutex         sync.RWMutex
+
+	// Matcher for reputation updates - defining an interface for SetUserReputation
+	matcher ReputationUpdater
+}
+
+// ReputationUpdater defines the interface needed from Matcher for P2P node to update reputation.
+type ReputationUpdater interface {
+	SetUserReputation(userID string, score int)
 }
 
 // NewP2PNode creates a new P2P node for the Lightning Loan Protocol
-func NewP2PNode(ctx context.Context, listenAddrs []multiaddr.Multiaddr, logger *zap.Logger) (*P2PNode, error) {
+func NewP2PNode(ctx context.Context, listenAddrs []multiaddr.Multiaddr, logger *zap.Logger, matcher ReputationUpdater) (*P2PNode, error) {
 	// Generate a new private key for this node
 	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.Ed25519, 2048, rand.Reader)
 	if err != nil {
@@ -110,11 +122,13 @@ func NewP2PNode(ctx context.Context, listenAddrs []multiaddr.Multiaddr, logger *
 		topics:        make(map[string]*pubsub.Topic),
 		subscriptions: make(map[string]*pubsub.Subscription),
 		privateKey:    priv,
-		nodeID:        nodeID,
-		logger:        logger,
-		handlers:      make(map[string]MessageHandler),
-		peers:         make(map[peer.ID]time.Time),
-		orderCache:    make(map[string]time.Time),
+		nodeID:             nodeID,
+		logger:             logger,
+		handlers:           make(map[string]MessageHandler),
+		peers:              make(map[peer.ID]time.Time),
+		orderCache:         make(map[string]time.Time),
+		latestBTCPriceUSDT: 0.0, // Initialize with a default value
+		matcher:            matcher,
 	}, nil
 }
 
@@ -152,6 +166,10 @@ func (n *P2PNode) Start(bootstrapPeers []multiaddr.Multiaddr) error {
 	for topicName, sub := range n.subscriptions {
 		go n.processMessages(topicName, sub)
 	}
+
+	// Register handlers
+	n.RegisterHandler("price_update", n.handlePriceUpdateMessage)
+	n.RegisterHandler("reputation_update", n.handleReputationUpdateMessage)
 
 	// Announce ourselves to the network
 	n.logger.Info("P2P node started",
@@ -590,8 +608,43 @@ func (n *P2PNode) PublishOrderBookEntry(entry *types.OrderBookEntry) error {
 }
 
 // PublishPriceUpdate publishes a price update to the network
-func (n *P2PNode) PublishPriceUpdate(priceData *types.PriceData) error {
+func (n *P2PNode) PublishPriceUpdate(priceData types.PriceData) error { // Changed to value type as per main.go
 	return n.BroadcastMessage(PriceFeedTopic, "price_update", priceData)
+}
+
+// handlePriceUpdateMessage handles incoming price update messages
+func (n *P2PNode) handlePriceUpdateMessage(sender peer.ID, msg *types.P2PMessage) error {
+	var priceData types.PriceData
+	if err := json.Unmarshal(msg.Payload, &priceData); err != nil {
+		n.logger.Error("Failed to unmarshal price update payload",
+			zap.String("sender", sender.Pretty()),
+			zap.Error(err))
+		return err
+	}
+
+	n.logger.Info("Received price update",
+		zap.String("sender", sender.Pretty()),
+		zap.Float64("price", priceData.BTCPriceUSDT),
+		zap.String("source", priceData.Source),
+		zap.Time("timestamp", priceData.Timestamp))
+
+	n.UpdateLatestBTCPrice(priceData.BTCPriceUSDT)
+	return nil
+}
+
+// UpdateLatestBTCPrice updates the latest BTC price in a thread-safe way
+func (n *P2PNode) UpdateLatestBTCPrice(price float64) {
+	n.priceMutex.Lock()
+	defer n.priceMutex.Unlock()
+	n.latestBTCPriceUSDT = price
+	n.logger.Debug("Updated local latestBTCPriceUSDT", zap.Float64("price", price))
+}
+
+// GetLatestBTCPrice returns the latest BTC price in a thread-safe way
+func (n *P2PNode) GetLatestBTCPrice() float64 {
+	n.priceMutex.RLock()
+	defer n.priceMutex.RUnlock()
+	return n.latestBTCPriceUSDT
 }
 
 // PublishLoanMatch publishes a loan match to the network
@@ -602,4 +655,42 @@ func (n *P2PNode) PublishLoanMatch(match *types.LoanMatch) error {
 // PublishReputationUpdate publishes a reputation update to the network
 func (n *P2PNode) PublishReputationUpdate(update *types.ReputationUpdate) error {
 	return n.BroadcastMessage(ReputationTopic, "reputation_update", update)
+}
+
+// handleReputationUpdateMessage handles incoming reputation update messages from peers.
+func (n *P2PNode) handleReputationUpdateMessage(sender peer.ID, msg *types.P2PMessage) error {
+	var update types.ReputationUpdate
+	if err := json.Unmarshal(msg.Payload, &update); err != nil {
+		n.logger.Error("Failed to unmarshal reputation update payload",
+			zap.String("sender", sender.Pretty()),
+			zap.Error(err))
+		return fmt.Errorf("failed to unmarshal reputation update payload: %w", err)
+	}
+
+	n.logger.Info("Received reputation update",
+		zap.String("sender", sender.Pretty()),
+		zap.String("userID", update.UserID),
+		zap.Int("oldScore", update.OldScore),
+		zap.Int("newScore", update.NewScore),
+		zap.String("reason", update.Reason),
+		zap.String("relatedLoanID", update.RelatedLoanID))
+
+	if n.matcher != nil {
+		// Update the local matcher's reputation store based on the received update.
+		// This allows the node to learn about reputation changes from other nodes.
+		n.matcher.SetUserReputation(update.UserID, update.NewScore)
+		n.logger.Debug("Updated local reputation store from network update",
+			zap.String("userID", update.UserID),
+			zap.Int("newScore", update.NewScore))
+	} else {
+		n.logger.Warn("Matcher not available in P2PNode, cannot apply reputation update from network",
+			zap.String("userID", update.UserID))
+	}
+
+	return nil
+}
+
+// GetHost returns the underlying libp2p host. Used by Oracle service to check initialization.
+func (n *P2PNode) GetHost() host.Host {
+	return n.host
 }

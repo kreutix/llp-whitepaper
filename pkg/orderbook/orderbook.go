@@ -463,14 +463,25 @@ func (ob *OrderBook) GetAllRequests() []*types.LoanRequest {
 }
 
 // GetMatchingOffers finds offers that match a loan request
-func (ob *OrderBook) GetMatchingOffers(request *types.LoanRequest, btcPriceUSDT float64) []*types.LoanOffer {
-	if request == nil {
+func (ob *OrderBook) GetMatchingOffers(request *types.LoanRequest, p2pNode *p2p.P2PNode) []*types.LoanOffer {
+	if request == nil || p2pNode == nil {
+		ob.logger.Warn("GetMatchingOffers called with nil request or p2pNode")
 		return nil
 	}
 
+	currentBTCPrice := p2pNode.GetLatestBTCPrice()
+	if currentBTCPrice <= 0 {
+		ob.logger.Warn("GetMatchingOffers: Invalid BTC price from P2P node", zap.Float64("price", currentBTCPrice))
+		return nil // Cannot calculate LTV with invalid price
+	}
+
 	// Calculate current LTV
-	ltv := request.CalculateLTV(btcPriceUSDT)
+	ltv := request.CalculateLTV(currentBTCPrice)
 	if ltv <= 0 {
+		ob.logger.Debug("GetMatchingOffers: Skipping due to invalid LTV",
+			zap.String("requestID", request.ID),
+			zap.Float64("ltv", ltv),
+			zap.Float64("btcPrice", currentBTCPrice))
 		return nil // Invalid LTV
 	}
 

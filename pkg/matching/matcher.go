@@ -46,7 +46,10 @@ type Matcher struct {
 	config    MatchingConfig
 	logger    *zap.Logger
 	// Map of user IDs to reputation scores (in a real implementation, this would be a separate service)
-	reputationStore map[string]int
+	reputationStore   map[string]int
+	reputationMutex   sync.RWMutex // To protect reputationStore
+	activeMatches     map[string]*types.LoanMatch
+	activeMatchesMutex sync.RWMutex
 }
 
 // NewMatcher creates a new matcher with the given order book and configuration
@@ -56,11 +59,21 @@ func NewMatcher(ob *orderbook.OrderBook, config MatchingConfig, logger *zap.Logg
 		config:          config,
 		logger:          logger,
 		reputationStore: make(map[string]int),
+		activeMatches:   make(map[string]*types.LoanMatch),
 	}
 }
 
-// SetUserReputation sets the reputation score for a user
+// SetOrderBook allows setting the order book after matcher initialization.
+// This is used to resolve circular dependency between Matcher and P2PNode/OrderBook.
+func (m *Matcher) SetOrderBook(ob *orderbook.OrderBook) {
+	m.orderBook = ob
+}
+
+// SetUserReputation sets the reputation score for a user in a thread-safe way
+// SetUserReputation sets the reputation score for a user in a thread-safe way
 func (m *Matcher) SetUserReputation(userID string, score int) {
+	m.reputationMutex.Lock()
+	defer m.reputationMutex.Unlock()
 	if score < types.MinReputationScore {
 		score = types.MinReputationScore
 	}
@@ -68,10 +81,13 @@ func (m *Matcher) SetUserReputation(userID string, score int) {
 		score = types.MaxReputationScore
 	}
 	m.reputationStore[userID] = score
+	m.logger.Debug("Set reputation", zap.String("userID", userID), zap.Int("score", score))
 }
 
-// GetUserReputation gets the reputation score for a user
+// GetUserReputation gets the reputation score for a user in a thread-safe way
 func (m *Matcher) GetUserReputation(userID string) int {
+	m.reputationMutex.RLock()
+	defer m.reputationMutex.RUnlock()
 	score, exists := m.reputationStore[userID]
 	if !exists {
 		return types.DefaultReputationScore
@@ -80,7 +96,10 @@ func (m *Matcher) GetUserReputation(userID string) int {
 }
 
 // MatchRequest attempts to match a loan request with available offers
-func (m *Matcher) MatchRequest(requestID string, btcPriceUSDT float64) (*types.LoanMatch, error) {
+func (m *Matcher) MatchRequest(requestID string, p2pNode *orderbook.P2PNode) (*types.LoanMatch, error) { // Changed p2p.P2PNode to orderbook.P2PNode
+	if p2pNode == nil {
+		return nil, fmt.Errorf("p2pNode cannot be nil")
+	}
 	// Get the request
 	request, err := m.orderBook.GetRequest(requestID)
 	if err != nil {
@@ -92,16 +111,22 @@ func (m *Matcher) MatchRequest(requestID string, btcPriceUSDT float64) (*types.L
 		return nil, fmt.Errorf("request is not pending (status: %s)", request.Status)
 	}
 
+	// Get current BTC price from P2P node
+	btcPriceUSDT := p2pNode.GetLatestBTCPrice()
+	if btcPriceUSDT <= 0 {
+		return nil, fmt.Errorf("invalid BTC price from P2P node: %f", btcPriceUSDT)
+	}
+
 	// Calculate current LTV
 	ltv := request.CalculateLTV(btcPriceUSDT)
 	if ltv <= 0 {
-		return nil, fmt.Errorf("invalid LTV ratio: %f", ltv)
+		return nil, fmt.Errorf("invalid LTV ratio: %f (BTC price: %f)", ltv, btcPriceUSDT)
 	}
 
 	// Get matching offers
-	matchingOffers := m.orderBook.GetMatchingOffers(request, btcPriceUSDT)
+	matchingOffers := m.orderBook.GetMatchingOffers(request, p2pNode) // Pass p2pNode
 	if len(matchingOffers) == 0 {
-		return nil, fmt.Errorf("no matching offers found for request %s", requestID)
+		return nil, fmt.Errorf("no matching offers found for request %s (BTC price: %f, LTV: %f)", requestID, btcPriceUSDT, ltv)
 	}
 
 	// Get borrower reputation
@@ -391,12 +416,156 @@ func (m *Matcher) FinalizeLoanMatch(match *types.LoanMatch) error {
 		zap.Int("lenderCount", len(match.MatchedLenders)),
 		zap.Float64("effectiveInterestRate", m.CalculateEffectiveInterestRate(match)))
 
+	// Add to active matches
+	m.activeMatchesMutex.Lock()
+	m.activeMatches[match.ID] = match
+	m.activeMatchesMutex.Unlock()
+	m.logger.Info("Added match to active matches", zap.String("matchID", match.ID))
+
+	return nil
+}
+
+// GetActiveMatch retrieves an active match by its ID
+func (m *Matcher) GetActiveMatch(matchID string) (*types.LoanMatch, bool) {
+	m.activeMatchesMutex.RLock()
+	defer m.activeMatchesMutex.RUnlock()
+	match, found := m.activeMatches[matchID]
+	return match, found
+}
+
+// GetAllActiveMatches retrieves all active matches
+func (m *Matcher) GetAllActiveMatches() []*types.LoanMatch {
+	m.activeMatchesMutex.RLock()
+	defer m.activeMatchesMutex.RUnlock()
+	matches := make([]*types.LoanMatch, 0, len(m.activeMatches))
+	for _, match := range m.activeMatches {
+		matches = append(matches, match)
+	}
+	return matches
+}
+
+// UpdateReputationAndFinalizeMatch updates user reputations based on loan outcome and finalizes the match.
+// p2pNodeInterface is used to avoid direct import of p2p package, promoting loose coupling.
+type p2pNodeInterface interface {
+	PublishReputationUpdate(*types.ReputationUpdate) error
+}
+
+func (m *Matcher) UpdateReputationAndFinalizeMatch(matchID string, wasSuccessful bool, finalStatus types.LoanStatus, p2pNode p2pNodeInterface) error {
+	m.activeMatchesMutex.Lock() // Ensure exclusive access for modification and removal
+	defer m.activeMatchesMutex.Unlock()
+
+	match, exists := m.activeMatches[matchID]
+	if !exists {
+		return fmt.Errorf("match with ID %s not found in active matches", matchID)
+	}
+
+	// Prevent re-processing if already in a terminal state by some other means (though caller should ideally prevent this)
+	if match.Status == types.StatusCompleted || match.Status == types.StatusDefaulted || match.Status == types.StatusLiquidated {
+		m.logger.Info("Match already in a terminal state, no further updates", zap.String("matchID", matchID), zap.String("status", string(match.Status)))
+		// remove from active matches if somehow it's still there
+		delete(m.activeMatches, matchID)
+		return nil
+	}
+
+	var borrowerRepChange, lenderRepChange int
+	var reputationReason string
+
+	// Set final status of the match
+	match.Status = finalStatus
+
+	if wasSuccessful { // Primarily for successful repayment
+		match.RepaidSuccessfully = true
+		match.Defaulted = false // Explicitly set, though should be default
+		borrowerRepChange = 10
+		lenderRepChange = 5
+		reputationReason = "Loan repaid successfully"
+		m.logger.Info("Loan status updated", zap.String("matchID", matchID), zap.String("borrowerID", match.BorrowerID), zap.String("newStatus", string(finalStatus)))
+	} else { // Covers defaults and liquidations for reputation purposes
+		match.RepaidSuccessfully = false
+		match.Defaulted = true // True for both payment default and liquidation from a repayment perspective
+		borrowerRepChange = -50
+		lenderRepChange = -5 // Penalize lenders slightly for association
+
+		switch finalStatus {
+		case types.StatusDefaulted:
+			reputationReason = "Loan defaulted (missed payments)"
+		case types.StatusLiquidated:
+			reputationReason = "Loan liquidated (LTV exceeded)"
+		default:
+			reputationReason = "Loan ended unsuccessfully"
+		}
+		m.logger.Warn("Loan status updated", zap.String("matchID", matchID), zap.String("borrowerID", match.BorrowerID), zap.String("newStatus", string(finalStatus)))
+	}
+
+	// Update borrower's reputation
+	oldBorrowerScore := m.GetUserReputation(match.BorrowerID)
+	newBorrowerScore := oldBorrowerScore + borrowerRepChange
+	m.SetUserReputation(match.BorrowerID, newBorrowerScore)
+	m.logger.Info("Borrower reputation updated",
+		zap.String("userID", match.BorrowerID),
+		zap.Int("oldScore", oldBorrowerScore),
+		zap.Int("newScore", newBorrowerScore),
+		zap.String("reason", reputationReason))
+
+	if p2pNode != nil {
+		reputationUpdate := &types.ReputationUpdate{
+			UserID:        match.BorrowerID,
+			OldScore:      oldBorrowerScore,
+			NewScore:      newBorrowerScore,
+			Reason:        fmt.Sprintf("%s (Borrower)", reputationReason),
+			RelatedLoanID: match.ID,
+			Timestamp:     time.Now(),
+		}
+		if err := p2pNode.PublishReputationUpdate(reputationUpdate); err != nil {
+			m.logger.Error("Failed to publish borrower reputation update", zap.Error(err), zap.String("userID", match.BorrowerID))
+		}
+	}
+
+	// Update lenders' reputation
+	for _, lender := range match.MatchedLenders {
+		oldLenderScore := m.GetUserReputation(lender.LenderID)
+		newLenderScore := oldLenderScore + lenderRepChange
+		m.SetUserReputation(lender.LenderID, newLenderScore)
+		m.logger.Info("Lender reputation updated",
+			zap.String("userID", lender.LenderID),
+			zap.Int("oldScore", oldLenderScore),
+			zap.Int("newScore", newLenderScore),
+			zap.String("reason", fmt.Sprintf("%s (Lender)", reputationReason)))
+
+		if p2pNode != nil {
+			lenderUpdate := &types.ReputationUpdate{
+				UserID:        lender.LenderID,
+				OldScore:      oldLenderScore,
+				NewScore:      newLenderScore,
+				Reason:        fmt.Sprintf("%s (Lender)", reputationReason),
+				RelatedLoanID: match.ID,
+				Timestamp:     time.Now(),
+			}
+			if err := p2pNode.PublishReputationUpdate(lenderUpdate); err != nil {
+				m.logger.Error("Failed to publish lender reputation update", zap.Error(err), zap.String("userID", lender.LenderID))
+			}
+		}
+	}
+
+	// Remove the match from activeMatches as it's now completed or defaulted
+	delete(m.activeMatches, matchID)
+	m.logger.Info("Removed match from active matches", zap.String("matchID", matchID), zap.String("status", string(match.Status)))
+
 	return nil
 }
 
 // CheckLTVRatio checks if the current LTV ratio is within acceptable limits
-func (m *Matcher) CheckLTVRatio(match *types.LoanMatch, currentBTCPriceUSDT float64) (float64, bool) {
+// TODO: This function seems to be unused by CLI commands directly, but good to update for internal use.
+func (m *Matcher) CheckLTVRatio(match *types.LoanMatch, p2pNode *orderbook.P2PNode) (float64, bool) { // Changed p2p.P2PNode to orderbook.P2PNode
+	if p2pNode == nil {
+		m.logger.Warn("CheckLTVRatio called with nil p2pNode")
+		return 0, false
+	}
+	currentBTCPriceUSDT := p2pNode.GetLatestBTCPrice()
 	if currentBTCPriceUSDT <= 0 || match.BTCCollateral <= 0 {
+		m.logger.Warn("CheckLTVRatio: Invalid price or collateral",
+			zap.Float64("btcPrice", currentBTCPriceUSDT),
+			zap.Float64("collateral", match.BTCCollateral))
 		return 0, false
 	}
 
@@ -417,9 +586,11 @@ func (m *Matcher) GetMatchesForUser(userID string, role types.UserRole) []*types
 	return []*types.LoanMatch{}
 }
 
-// GetMatchByID retrieves a loan match by ID
+// GetMatchByID retrieves a loan match by ID (deprecated, use GetActiveMatch or a persistent store in future)
 func (m *Matcher) GetMatchByID(matchID string) (*types.LoanMatch, error) {
-	// In a real implementation, this would query a database of matches
-	// For MVP, this is a placeholder
-	return nil, fmt.Errorf("match with ID %s not found", matchID)
+	match, found := m.GetActiveMatch(matchID)
+	if !found {
+		return nil, fmt.Errorf("active match with ID %s not found", matchID)
+	}
+	return match, nil
 }

@@ -195,6 +195,9 @@ type LoanMatch struct {
 	NextPaymentDue    time.Time       `json:"next_payment_due"`    // When the next interest payment is due
 	PaymentsMade      int             `json:"payments_made"`       // Number of interest payments made
 	PaymentsMissed    int             `json:"payments_missed"`     // Number of missed payments
+	RepaidSuccessfully bool            `json:"repaid_successfully"` // True if the loan was fully repaid
+	Defaulted          bool            `json:"defaulted"`           // True if the loan was defaulted on
+	LastPaymentAttemptDate time.Time `json:"last_payment_attempt_date"` // Tracks the last day a payment attempt was processed
 }
 
 // Validate checks if the LoanMatch is valid
@@ -247,7 +250,7 @@ func (m *LoanMatch) CalculateTotalDailyInterest() float64 {
 type PriceData struct {
 	BTCPriceUSDT  float64   `json:"btc_price_usdt"` // Current BTC price in USDT
 	Timestamp     time.Time `json:"timestamp"`      // When the price was recorded
-	SourceOracles []string  `json:"source_oracles"` // List of oracle sources
+	Source        string    `json:"source"`         // Name of the oracle source (e.g. "MockOracle", "Binance") - Changed from SourceOracles
 }
 
 // OrderBookEntry represents an entry in the decentralized order book
